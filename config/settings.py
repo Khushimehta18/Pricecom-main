@@ -196,6 +196,9 @@ SECURE_HSTS_PRELOAD = True
 CORS_ALLOWED_ORIGINS = os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000').split(',')
 CORS_ALLOW_CREDENTIALS = True
 
+# External APIs
+SERPAPI_API_KEY = os.getenv('SERPAPI_API_KEY', '')
+
 # --- SOCIAL AUTH (django-allauth) ---
 AUTHENTICATION_BACKENDS = [
     'django.contrib.auth.backends.ModelBackend',
@@ -231,4 +234,15 @@ ACCOUNT_USERNAME_REQUIRED = False
 ACCOUNT_AUTHENTICATION_METHOD = 'email'
 SOCIALACCOUNT_AUTO_SIGNUP = True 
 ACCOUNT_EMAIL_VERIFICATION = 'mandatory'
+
+# ================= CELERY CONFIG =================
+# Force local Redis broker/result backend for Celery
+CELERY_BROKER_URL = "redis://127.0.0.1:6379/0"
+CELERY_RESULT_BACKEND = "redis://127.0.0.1:6379/0"
+
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TIMEZONE = "UTC"
+# =================================================
 

@@ -12,8 +12,7 @@
     <div class="overflow-x-auto">
         <table class="w-full text-left border-collapse min-w-[800px] font-mono whitespace-nowrap">
             <thead>
-                <tr
-                    class="bg-[#080B0F] text-[10px] text-brand-textMuted uppercase tracking-wider border-b border-brand-border">
+                <tr class="bg-[#080B0F] text-[10px] text-brand-textMuted uppercase tracking-wider border-b border-brand-border">
                     <th class="px-4 py-2 font-normal">ASSET_ID</th>
                     <th class="px-4 py-2 font-normal">NODE_AMZ</th>
                     <th class="px-4 py-2 font-normal">NODE_FLIP</th>
@@ -22,10 +21,8 @@
                     <th class="px-4 py-2 text-right font-normal">EXEC</th>
                 </tr>
             </thead>
-            <!-- HTMX GET Request - tbody has id for external injection -->
-            <tbody id="products-tbody" class="divide-y divide-brand-border text-xs" hx-get="/dashboard/api/products/" hx-trigger="load"
-                hx-swap="innerHTML">
-                <!-- Skeleton Loader -->
+            <tbody id="products-tbody" class="divide-y divide-brand-border text-xs"
+                hx-get="/dashboard/api/products/" hx-trigger="load" hx-swap="innerHTML">
                 <tr>
                     <td colspan="6" class="px-4 py-12 text-center text-brand-textMuted">
                         <i class="fas fa-circle-notch fa-spin text-brand-accent mr-2 text-xl"></i>

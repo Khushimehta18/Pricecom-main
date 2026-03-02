@@ -18,6 +18,10 @@
 {% endif %}
 {% endfor %}
 
+{% if items|length == 0 %}
+<p class="text-center text-[#64748b] text-xs font-mono">NO WATCHLIST SIGNALS AVAILABLE</p>
+{% endif %}
+
 <!-- Reward -->
 <div
     class="bg-[#0a0d14] p-3 text-[#ffb000] font-mono text-[10px] uppercase border border-[#ffb000]/30 mt-6 relative overflow-hidden">
@@ -30,5 +34,5 @@
 </div>
 <script>
     // Alpine variable update via script tag injection trick
-    window.dispatchEvent(new CustomEvent('update-watchlist-count', { detail: {{ items| length }} }));
+    window.dispatchEvent(new CustomEvent('update-watchlist-count', { detail: {{ items|length }} }));
 </script>

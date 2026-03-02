@@ -1,14 +1,106 @@
 import logging
 import time
+from decimal import Decimal
 from celery import shared_task, group
 from django.contrib.auth import get_user_model
 from django.conf import settings
+import json
+from urllib.parse import urlparse
+import os
 from apps.scraper.services.services import ScraperService
 from apps.scraper.models import Product, PriceAlert
 from apps.scraper.services.smtp_handler import send_monitored_email
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
+
+
+@shared_task
+def search_and_scrape(query: str):
+    """Lightweight Celery task to scrape and persist products for a query."""
+    logger.info('TASK START simple search %r', query)
+    service = ScraperService()
+    try:
+        items = service.scrape(query)
+        logger.info('SCRAPER COUNT %d', len(items))
+        normalized = []
+        for it in items:
+            price = it.get('price')
+            if isinstance(price, Decimal):
+                try:
+                    it['price'] = float(price)
+                except Exception:
+                    it['price'] = None
+            normalized.append(it)
+        persisted = service.persist_results(query, query, normalized)
+        rows = persisted.get('rows', [])
+        if not rows:
+            logger.warning("NO ROWS GENERATED — check ScraperService.persist_results")
+        else:
+            logger.info("ROWS GENERATED: %s", rows[:2])
+        product_obj = persisted.get('product')
+        return {
+            'status': 'SUCCESS' if rows else 'FAILURE',
+            'results': rows,
+            'product': getattr(product_obj, 'id', None),
+        }
+    except Exception:
+        logger.exception('search_and_scrape failure')
+        return {'status': 'FAILURE', 'error': 'scrape_failed', 'results': [], 'product': None}
+
+
+@shared_task(bind=True)
+def celery_ping(self):
+    """Lightweight task to confirm Celery registration and worker startup."""
+    logger.info("CELERY PING RECEIVED")
+    return "pong"
+
+
+@shared_task(bind=True)
+def image_search_task(self, temp_path: str, ocr_text: str | None = None, frontend_task_id: str | None = None):
+    """Run a search+scrape for OCR text (or filename) and cache results under frontend task id in Redis."""
+    query = ocr_text or os.path.basename(temp_path)
+    try:
+        # run the core search task synchronously to obtain payload and pass frontend id so worker caches under same key
+        result = search_and_scrape_task.apply(args=[query], kwargs={'frontend_task_id': frontend_task_id}).get()
+    except Exception as exc:
+        result = {
+            'status': 'FAILURE',
+            'error': str(exc),
+            'raw_query': query,
+            'clean_query': query,
+            'results': [],
+            'chart': {},
+        }
+
+    # Determine frontend task id from provided arg or request kwargs
+    try:
+        fid = frontend_task_id or getattr(self.request, 'kwargs', {}).get('task_id') or getattr(self.request, 'kwargs', {}).get('frontend_task_id')
+    except Exception:
+        fid = frontend_task_id
+
+    if not fid:
+        try:
+            args = getattr(self.request, 'args', [])
+            if len(args) >= 3:
+                fid = args[2]
+        except Exception:
+            fid = None
+
+    if fid:
+        try:
+            import redis as _redis
+            redis_url = getattr(settings, 'CELERY_BROKER_URL', 'redis://127.0.0.1:6379/0')
+            print("WORKER RUNNING TASK:", query)
+            print("FRONTEND TASK ID:", fid)
+            print("REDIS URL:", redis_url)
+            r = _redis.StrictRedis.from_url(redis_url)
+            r.setex(f"pricecom:task:{fid}", 3600, json.dumps(result, default=str))
+            print("REDIS WRITE DONE")
+        except Exception:
+            logger.exception('Failed to write cached image task result to Redis')
+
+    return result
 
 # --- BACK-ROOM WORKER LOGIC ---
 
@@ -145,29 +237,93 @@ def search_and_scrape_task(self, query: str, user_id: int = None):
     """
     Parallel Search Orchestrator.
     """
-    logger.info(f"Search Worker: Searching for {query}")
-    service = ScraperService()
-    results = []
-    
-    stores = ['Amazon', 'Flipkart']
-    scrape_jobs = []
-    
-    for store in stores:
+    task_id = getattr(self.request, 'id', None)
+    logger.info('TASK START %s %r', task_id, query)
+
+    result_payload = {'status': 'FAILURE', 'error': 'init', 'results': [], 'product': None}
+
+    try:
+        # Ensure SERPAPI key visibility inside worker
         try:
-            items = service.search_products(query, store)
-            for item in items:
-                if item.get('url'):
-                    # Queue extraction for each result found
-                    scrape_jobs.append(scrape_product_task.s(item['url'], store, user_id))
-                    results.append(item)
-        except Exception as e:
-            logger.error(f"Search failed for {store}: {e}")
-            
-    # Fire all extraction jobs in parallel
-    if scrape_jobs:
-        group(scrape_jobs).apply_async()
-        
-    return f"Found {len(results)} items, triggered extraction."
+            key = getattr(settings, 'SERPAPI_API_KEY', '') or ''
+            logger.info('SERPAPI_API_KEY length: %d', len(key))
+        except Exception:
+            logger.warning('Could not read SERPAPI_API_KEY from settings')
+
+        service = ScraperService()
+        # read frontend_task_id if provided in kwargs (used for caching)
+        frontend_task_id = getattr(self.request, 'kwargs', {}).get('frontend_task_id') if hasattr(self, 'request') else None
+
+        # Fallback: if cleaned query empty, try raw_query from kwargs
+        raw_query = None
+        try:
+            raw_query = self.request.kwargs.get('raw_query')  # type: ignore
+        except Exception:
+            raw_query = None
+        if not query and raw_query:
+            query = raw_query
+
+        if not query:
+            logger.warning('Empty query received by search_and_scrape_task; aborting')
+            result_payload = {'status': 'FAILURE', 'error': 'Empty query', 'results': [], 'product': None}
+            return result_payload
+
+        items = service.scrape(query)
+        logger.info('TASK QUERY: %s', query)
+        try:
+            keylen = len(getattr(settings, 'SERPAPI_API_KEY', '') or '')
+        except Exception:
+            keylen = 0
+        logger.info('SERPAPI_API_KEY length: %d', keylen)
+        logger.info('SCRAPER COUNT %d', len(items))
+        logger.info('SCRAPE SAMPLE: %s', items[:2])
+
+        normalized = []
+        for it in items:
+            price = it.get('price')
+            if isinstance(price, Decimal):
+                try:
+                    it['price'] = float(price)
+                except Exception:
+                    it['price'] = None
+            normalized.append(it)
+
+        persisted = service.persist_results(query, raw_query or query, normalized)
+        rows = persisted.get('rows', [])
+        product_obj = persisted.get('product')
+        result_payload = {
+            'status': 'SUCCESS' if rows else 'FAILURE',
+            'results': rows,
+            'product': getattr(product_obj, 'id', None),
+        }
+        return result_payload
+    except Exception:
+        logger.exception('search_and_scrape_task failure')
+        result_payload = {'status': 'FAILURE', 'error': 'scrape_or_cache_failed', 'results': [], 'product': None}
+        return result_payload
+    finally:
+        try:
+            # choose cache key: prefer frontend_task_id if available else use celery task id
+            cache_key_id = None
+            try:
+                cache_key_id = getattr(self.request, 'kwargs', {}).get('frontend_task_id') or task_id
+            except Exception:
+                cache_key_id = task_id
+
+            if cache_key_id:
+                try:
+                    import redis
+                    redis_url = getattr(settings, 'CELERY_BROKER_URL', 'redis://127.0.0.1:6379/0')
+                    r = redis.StrictRedis.from_url(redis_url)
+                    result_count = len(result_payload.get('results', []) if isinstance(result_payload, dict) else [])
+                    logger.info('TASK CACHE KEY %s', cache_key_id)
+                    logger.info('RESULT COUNT %s', result_count)
+                    r.setex(f"pricecom:task:{cache_key_id}", 3600, json.dumps(result_payload, default=str))
+                    logger.info('CACHE WRITE SUCCESS key=%s', cache_key_id)
+                except Exception:
+                    logger.exception('cache write failure')
+        except Exception:
+            logger.exception('cache write outer failure')
 
 @shared_task(bind=True)
 def check_alerts_task(self, product_id: int):

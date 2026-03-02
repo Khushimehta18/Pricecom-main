@@ -7,11 +7,16 @@
 
     <!-- Top Summary Cards row -->
     <div class="grid grid-cols-1 md:grid-cols-5 gap-[1px]">
-        <c-stat_card title="Products Tracked" value="8,421" sublabel="+312 this week" />
-        <c-stat_card title="Price Drop Today" value="284" sublabel="products | -12.4% market shift" />
-        <c-stat_card title="Avg Market Change" value="+2.1%" sublabel="across 47 stores" />
-        <c-stat_card title="Active Alerts" value="12" sublabel="3 critical, 9 standard" />
-        <c-stat_card title="Data Freshness" value="LIVE" sublabel="12ms latency" type="freshness" />
+        {% for card in stat_cards %}
+            <c-stat_card
+                title="{{ card.title }}"
+                value="{{ card.value }}"
+                sublabel="{{ card.sublabel }}"
+                {% if card.type %}type="{{ card.type }}"{% endif %}
+            />
+        {% empty %}
+            <c-stat_card title="Products Tracked" value="8,421" sublabel="sync pending" />
+        {% endfor %}
     </div>
 
     <!-- Main Workspace Split -->
@@ -19,14 +24,18 @@
 
         <!-- Left Analysis Area -->
         <div class="lg:col-span-9 flex flex-col gap-[1px]">
+            <!-- Image Upload Card (new) -->
+            <div class="w-full mb-3">
+                    {% include 'dashboard/partials/image_upload_card.html' %}
+            </div>
+
             <!-- Chart Panel -->
             <div class="w-full">
                 <c-price_chart />
             </div>
-            <!-- Data Grid -->
-            <div class="w-full">
-                <c-price_table />
-            </div>
+                <div class="w-full">
+                    {% include 'dashboard/partials/price_table.html' %}
+                </div>
         </div>
 
         <!-- Right Intelligence & Action Area -->
@@ -46,3 +55,7 @@
     </div>
 </div>
 {% endblock %}
+
+{% if chart_seed %}
+    {{ chart_seed|json_script:"chart-seed-data" }}
+{% endif %}

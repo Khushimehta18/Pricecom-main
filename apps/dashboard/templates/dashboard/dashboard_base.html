@@ -138,6 +138,8 @@
 
 <body x-data="pricecomStore" class="antialiased h-screen overflow-hidden flex bg-brand-base text-sm">
 
+    <form style="display:none">{% csrf_token %}</form>
+
     <!-- HTMX Global Error Banner -->
     <div id="global-error"
         class="fixed top-0 inset-x-0 bg-[#ff3366] text-[#080B0F] font-mono text-center py-2 text-xs font-bold tracking-widest z-[9999]"
@@ -255,7 +257,14 @@
             selectedProductId: null,
             predictionSignal: '{{ prediction.signal|default:""|escapejs }}',
             systemError: false,
-            watchlistCount: 0
+            watchlistCount: 0,
+            imageSearchState: {
+                taskId: null,
+                status: null,
+                results: null,
+                ocrText: null,
+                error: null
+            }
             });
 
         Alpine.data('pricecomStore', () => ({
@@ -277,14 +286,114 @@
         });
         });
 
-        // Custom HTMX configurations
+        // Custom HTMX configurations: attach Django CSRF token to non-GET requests
+        function getCookie(name) {
+            let cookieValue = null;
+            if (document.cookie && document.cookie !== '') {
+                const cookies = document.cookie.split(';');
+                for (let i = 0; i < cookies.length; i++) {
+                    const cookie = cookies[i].trim();
+                    // Does this cookie string begin with the name we want?
+                    if (cookie.substring(0, name.length + 1) === (name + '=')) {
+                        cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+                        break;
+                    }
+                }
+            }
+            return cookieValue;
+        }
+
         document.body.addEventListener('htmx:configRequest', function (evt) {
-            // Add CSRF to HTMX POST requests manually if not within form
-            var csrf = document.querySelector('[name=csrfmiddlewaretoken]');
-            if (csrf && evt.detail.verb !== 'get') {
-                evt.detail.headers['X-CSRFToken'] = csrf.value;
+            // Prefer explicit csrf token field if present (forms), otherwise fall back to cookie
+            var csrfInput = document.querySelector('input[name=csrfmiddlewaretoken]');
+            var token = csrfInput ? csrfInput.value : getCookie('csrftoken');
+            if (token && evt.detail.verb.toLowerCase() !== 'get') {
+                evt.detail.headers['X-CSRFToken'] = token;
             }
         });
+
+        // Image search polling: polls /dashboard/api/result/<task_id>/ until SUCCESS/FAILURE
+        window.startImagePoll = function(taskId){
+            try{
+                const store = Alpine.store('pricecomStore');
+                store.imageSearchState = { taskId: taskId, status: 'PENDING', results: null, ocrText: store.imageSearchState.ocrText || null, error: null };
+                let attempts = 0;
+                const start = Date.now();
+                const maxTime = 120000; // 2 minutes
+
+                async function poll(){
+                    try{
+                        const resp = await fetch(`/dashboard/api/result/${taskId}/`, { method: 'GET', headers: { 'HX-Request': 'true' } });
+                        if(!resp.ok){ throw new Error('Network error'); }
+                        const data = await resp.json();
+                        store.imageSearchState.status = data.status || store.imageSearchState.status;
+
+                        if(data.status === 'SUCCESS'){
+                            store.imageSearchState.results = data.results || [];
+                            // update product table rows
+                            const tbody = document.getElementById('products-tbody');
+                            if(tbody){
+                                tbody.innerHTML = '';
+                                (data.results || []).forEach(function(item){
+                                    const tr = document.createElement('tr');
+                                    tr.className = 'hover:bg-[#0a111a] transition-none group cursor-pointer';
+                                    const name = (item.name || item.store || 'Result');
+                                    const price = item.price ? ('₹' + Number(item.price).toLocaleString('en-IN')) : 'N/A';
+                                    const alt = item.alt_price ? ('₹' + Number(item.alt_price).toLocaleString('en-IN')) : 'N/A';
+                                    const minv = item.min_price ? ('₹' + Number(item.min_price).toLocaleString('en-IN')) : price;
+                                    const delta = item.delta || '';
+                                    const url = item.url || '#';
+                                    tr.innerHTML = `
+                                        <td class="px-4 py-3">
+                                            <div class="flex items-center space-x-3">
+                                                <div>
+                                                    <p class="text-brand-textHighlight group-hover:text-brand-accent">${name}</p>
+                                                </div>
+                                            </div>
+                                        </td>
+                                        <td class="px-4 py-3 tabular-nums text-brand-textMuted">${price}</td>
+                                        <td class="px-4 py-3 tabular-nums text-brand-textMuted">${alt}</td>
+                                        <td class="px-4 py-3 tabular-nums"><span class="font-bold text-brand-success">${minv}</span></td>
+                                        <td class="px-4 py-3"><span class="text-[10px] text-brand-textMuted bg-[#0D1117] px-1 border border-brand-border">${delta}</span></td>
+                                        <td class="px-4 py-3 text-right"><a href="${url}" target="_blank" class="bg-transparent text-brand-accent border border-brand-accent px-3 py-1 text-[10px] uppercase tracking-widest hover:bg-brand-accent hover:text-[#080B0F] transition-none">VISIT</a></td>
+                                    `;
+                                    tbody.appendChild(tr);
+                                });
+                            }
+
+                            // update chart if provided
+                            if(window.ApexCharts && data.chart){
+                                if(data.chart.series){ ApexCharts.exec('priceHistoryChart', 'updateSeries', data.chart.series); }
+                                if(data.chart.categories){ ApexCharts.exec('priceHistoryChart', 'updateOptions', { xaxis: { categories: data.chart.categories } }); }
+                            }
+
+                            store.imageSearchState.status = 'SUCCESS';
+                            return;
+                        }
+
+                        if(data.status === 'FAILURE'){
+                            store.imageSearchState.error = data.error || 'Processing failed';
+                            store.imageSearchState.status = 'FAILURE';
+                            return;
+                        }
+
+                    }catch(err){
+                        console.error('image poll error', err);
+                    }
+
+                    attempts++;
+                    if(Date.now() - start > maxTime){
+                        store.imageSearchState.error = 'Timed out waiting for results';
+                        store.imageSearchState.status = 'TIMEOUT';
+                        return;
+                    }
+                    const delay = attempts > 15 ? 5000 : 2000;
+                    setTimeout(poll, delay);
+                }
+
+                poll();
+            }catch(e){ console.error('startImagePoll error', e); }
+        }
     </script>
 </body>
 

@@ -43,22 +43,34 @@
 
 <script>
     document.addEventListener('DOMContentLoaded', () => {
-        if (typeof ApexCharts !== 'undefined') {
-            new ApexCharts(document.querySelector("#price-history-chart"), {
-                series: [
-                    { name: 'Electronics', data: [500, 480, 450, 430, 420, 410, 410] },
-                    { name: 'Apparel', data: [150, 150, 155, 158, 160, 160, 156] },
-                    { name: 'Home Goods', data: [320, 310, 305, 300, 290, 295, 298] }
-                ],
-                chart: {
-                    height: '100%',
-                    type: 'area',
-                    background: 'transparent',
-                    fontFamily: '"JetBrains Mono", monospace',
-                    animations: { enabled: false },
-                    toolbar: { show: false },
-                    zoom: { enabled: false }
-                },
+        if (typeof ApexCharts === 'undefined') {
+            return;
+        }
+
+        const seedEl = document.getElementById('chart-seed-data');
+        const seedData = seedEl ? JSON.parse(seedEl.textContent) : null;
+        const initialSeries = (seedData && seedData.series && seedData.series.length)
+            ? seedData.series
+            : [
+                { name: 'Amazon', data: [0, 0, 0, 0, 0, 0, 0] },
+                { name: 'Flipkart', data: [0, 0, 0, 0, 0, 0, 0] }
+            ];
+        const initialCategories = (seedData && seedData.categories && seedData.categories.length)
+            ? seedData.categories
+            : ['-', '-', '-', '-', '-', '-', '-'];
+
+        const chart = new ApexCharts(document.querySelector("#price-history-chart"), {
+            series: initialSeries,
+            chart: {
+                id: 'priceHistoryChart',
+                height: '100%',
+                type: 'area',
+                background: 'transparent',
+                fontFamily: '"JetBrains Mono", monospace',
+                animations: { enabled: false },
+                toolbar: { show: false },
+                zoom: { enabled: false }
+            },
                 colors: ['#00e5ff', '#00ff9d', '#ff3366'],
                 fill: {
                     type: 'gradient',
@@ -73,7 +85,7 @@
                     yaxis: { lines: { show: true } }
                 },
                 xaxis: {
-                    categories: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+                    categories: initialCategories,
                     axisBorder: { color: '#1A1F28' },
                     axisTicks: { color: '#1A1F28' },
                     labels: { style: { colors: '#64748b', fontSize: '10px' } },
@@ -89,7 +101,7 @@
                     tickAmount: 5,
                     labels: {
                         style: { colors: '#64748b', fontSize: '10px' },
-                        formatter: (val) => '$' + val
+                        formatter: (val) => '₹' + Number(val).toLocaleString('en-IN')
                     }
                 },
                 legend: { show: false },
@@ -98,7 +110,9 @@
                     marker: { show: false },
                     x: { show: true }
                 }
-            }).render();
-        }
+            });
+
+        chart.render();
+        window.priceHistoryChartRef = chart;
     });
 </script>

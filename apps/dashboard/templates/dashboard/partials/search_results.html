@@ -6,17 +6,27 @@
         <span class="blinking-cursor ml-2"></span>
     </div>
 
-    <div class="space-y-2 mt-2 border-t border-[#00ff9d]/20 pt-4 text-xs">
-        <div
-            class="flex justify-between hover:bg-[#00ff9d]/10 p-2 cursor-pointer transition-none border border-transparent hover:border-[#00ff9d]/40">
-            <span class="text-[#e2e8f0]">MATCH_FOUND :: {{ query }}</span>
-            <span class="text-brand-textMuted tracking-widest">RANK_01</span>
-        </div>
-        <div
-            class="flex justify-between hover:bg-[#00ff9d]/10 p-2 cursor-pointer transition-none border border-transparent hover:border-[#00ff9d]/40">
-            <span class="text-[#e2e8f0]">ALT_MATCH :: {{ query }} SIMILAR</span>
-            <span class="text-brand-textMuted tracking-widest">RANK_02</span>
-        </div>
+    <div class="space-y-2 mt-2 border-t border-[#00ff9d]/20 pt-4 text-xs w-full">
+        {% if results %}
+            {% for result in results %}
+            <a href="{{ result.url }}" target="_blank"
+                class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 hover:bg-[#00ff9d]/10 p-3 cursor-pointer transition-none border border-transparent hover:border-[#00ff9d]/40">
+                <div class="text-[#e2e8f0]">
+                    <span class="font-bold">{{ result.name }}</span>
+                    {% if result.sku %}<span class="ml-2 text-[10px] text-[#94a3b8]">SKU: {{ result.sku }}</span>{% endif %}
+                </div>
+                <div class="flex items-center space-x-4 text-[10px] uppercase tracking-widest">
+                    <span class="text-brand-textMuted">{{ result.store|default:'-' }}</span>
+                    <span class="text-[#00ff9d] text-base">{{ result.price }}</span>
+                    {% if result.last_updated %}
+                        <span class="text-brand-textMuted">{{ result.last_updated|date:"d M H:i" }}</span>
+                    {% endif %}
+                </div>
+            </a>
+            {% endfor %}
+        {% else %}
+            <p class="text-[#e2e8f0]">NO MATCHES_FOUND :: REVISE_QUERY</p>
+        {% endif %}
     </div>
 </div>
 {% endif %}

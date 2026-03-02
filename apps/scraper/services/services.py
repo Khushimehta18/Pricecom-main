@@ -1,179 +1,321 @@
 import logging
-import hashlib
-from typing import Dict, Optional, Any
+import random
+import time
+import re
+from typing import Dict, Optional, Any, List
 from decimal import Decimal
 from datetime import datetime
+from urllib.parse import quote_plus
 
-from apps.scraper.logic.amazon import AmazonScraper
-from apps.scraper.logic.flipkart import FlipkartScraper
-from apps.scraper.models import Product, StorePrice
+import requests
+from bs4 import BeautifulSoup
+from difflib import SequenceMatcher
+from django.db import transaction
+from django.utils import timezone
+from django.conf import settings
+
+SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
+
+from apps.scraper.models import Product, StorePrice, PriceHistory
 
 logger = logging.getLogger(__name__)
 
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+]
+
+
 class ScraperService:
-    """
-    Service layer that orchestrates the scraping process.
-    Delegates the actual scraping to store-specific implementations (Framework).
-    Handles data persistence.
-    """
+    """Generic scraper that can search Amazon/Flipkart and persist prices."""
 
-    def _get_scraper_class(self, store_name: str):
-        if store_name.lower() == 'amazon':
-            return AmazonScraper
-        elif store_name.lower() == 'flipkart':
-            return FlipkartScraper
-        else:
-            raise ValueError(f"No scraper implementation found for store: {store_name}")
+    def __init__(self) -> None:
+        # last_error is used by callers to understand why scraping returned no results
+        self.last_error: str | None = None
 
-    def fetch_product_data(self, url: str, store_name: str) -> Dict[str, Any]:
-        """
-        Fetches product data using the appropriate Scraper class.
-        """
-        logger.info(f"Initiating scrape for {url} on {store_name}")
-        
-        try:
-            ScraperClass = self._get_scraper_class(store_name)
-            
-            # Use Context Manager to ensure driver is handled correctly
-            with ScraperClass() as scraper:
-                data = scraper.scrape(url)
-                
-            # Normalize keys if necessary (BaseScraper returns 'title', 'price', 'status')
-            data["store"] = store_name
-            data["success"] = data.get("status") == "success"
-            # Map 'title' to 'name' for consistency with internal logic if needed, 
-            # though save_product below can just use 'title'
-            data["name"] = data.get("title") 
-            
-            return data
+    def search_all(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        # Use SerpAPI-backed scrape by default for reliability
+        return self.scrape(query, limit)
 
-        except Exception as e:
-            logger.exception(f"Error during scraping execution: {e}")
-            return {
-                "url": url,
-                "store": store_name,
-                "success": False,
-                "error": str(e)
-            }
-
-    def save_product(self, data: Dict[str, Any]) -> Optional[Product]:
-        """
-        Saves the scraped data to the database using the new normalized schema.
-        """
-        if not data.get("success"):
-            logger.warning(f"Skipping save for failed scrape: {data.get('url')}")
-            return None
-        
-        try:
-            # 1. Update/Create Product (Meta)
-            product, created = Product.objects.get_or_create(
-                name=data.get("name") or "Unknown Product",
-                defaults={
-                    "brand": "Unknown", # Needs logic or parsing
-                    "category": "Uncategorized"
-                }
-            )
-            
-            # 2. Update/Create StorePrice
-            # Ensure price is a Decimal
-            price_val = data.get("price")
-            if price_val is None:
-                 price_val = Decimal("0.00")
-
-            # Data Integrity Hash
-            # Hash = SHA256(price_str + timestamp_str + secret_salt)
-            timestamp = datetime.now().isoformat()
-            raw_data = f"{price_val}{timestamp}{'SUPER_SECRET_SALT'}"
-            price_hash = hashlib.sha256(raw_data.encode()).hexdigest()
-
-            price_obj, price_created = StorePrice.objects.update_or_create(
-                product=product,
-                store_name=data["store"],
-                defaults={
-                    "current_price": price_val,
-                    "product_url": data["url"],
-                    "image_url": data.get("image_url", ""), # BaseScraper might not extract image yet, handled in cleanup
-                    "is_available": True,
-                    "price_hash": price_hash
-                }
-            )
-            # 3. Create PriceHistory with Signature
-            # Import strictly here or top level
-            from apps.scraper.models import PriceHistory
-            from apps.scraper.security_utils import generate_signature
-            from django.conf import settings
-            
-            # Data to sign (Deterministic for verification)
-            history_data = {
-                'price': str(price_val),
-                'currency': 'INR'
-            }
-            signature = generate_signature(settings.SECRET_KEY, history_data)
-            
-            PriceHistory.objects.create(
-                store_price=price_obj,
-                price=price_val,
-                currency='INR',
-                data_signature=signature
-            )
-
-            logger.info(f"Product saved successfully: {product.name}")
-            return product
-            
-        except Exception as e:
-            logger.error(f"Failed to save product data: {e}")
-            return None
-
-    def search_products(self, query: str, store_name: str) -> list[Dict[str, Any]]:
-        """
-        Searches for products on the specified store and returns a list of results (URLs/Basic Info).
-        """
-        logger.info(f"Searching for '{query}' on {store_name}")
-        
-        try:
-            ScraperClass = self._get_scraper_class(store_name)
-            
-            with ScraperClass() as scraper:
-                # We need to implement get_search_results in the specific scraper classes
-                if hasattr(scraper, 'get_search_results'):
-                     results = scraper.get_search_results(query)
-                else:
-                    logger.warning(f"{store_name} scraper does not support search.")
-                    results = []
-            
-            return results
-
-        except Exception as e:
-            logger.exception(f"Error during search execution on {store_name}: {e}")
+    def scrape(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Fetch results from SerpAPI Google Shopping and normalize them."""
+        self.last_error = None
+        SERPAPI_API_KEY = getattr(settings, 'SERPAPI_API_KEY', '') or os.getenv('SERPAPI_API_KEY', '')
+        if not SERPAPI_API_KEY:
+            self.last_error = 'Missing SERPAPI_API_KEY'
+            logger.error(self.last_error)
             return []
 
-    def find_cheaper_alternative(self, product_name: str, current_price: Decimal, exclude_store: str) -> Dict[str, Any]:
-        """
-        Cross-Store Analysis Hook.
-        Performs a secondary 'Quick Search' on competing platforms.
-        If a lower price is found, returns the link and savings amount.
-        """
-        stores = ['Amazon', 'Flipkart']
-        target_store = next((s for s in stores if s.lower() != exclude_store.lower()), 'Amazon')
-        
-        logger.info(f"Cross-Store Analysis: Searching for '{product_name}' on {target_store}")
-        
-        results = self.search_products(product_name, target_store)
-        
-        # This is a naive heuristic (first result). In production, 
-        # ML product matching would be used.
-        if results:
-            best_match = results[0]
-            compare_price = Decimal(str(best_match.get('price', 0)))
-            
-            if compare_price > 0 and compare_price < current_price:
-                savings = current_price - compare_price
-                return {
-                    "found": True,
-                    "cheaper_link": best_match.get('url'),
-                    "savings_amount": float(savings),
-                    "store": target_store,
-                    "price": float(compare_price)
+        def _call_serp(q: str) -> Optional[dict]:
+            params = {
+                'engine': 'google_shopping',
+                'q': q,
+                'api_key': SERPAPI_API_KEY,
+                'hl': 'en',
+                'gl': 'in',
+                'num': 20,
+            }
+            try:
+                resp = requests.get(SERPAPI_ENDPOINT, params=params, timeout=20)
+                resp.raise_for_status()
+                data = resp.json()
+                logger.info('SERPAPI RAW COUNT %s', len(data.get('shopping_results', [])))
+                return data
+            except Exception as exc:
+                self.last_error = f'SerpAPI error: {exc}'
+                logger.exception('SerpAPI request failed')
+                return None
+
+        # Try original query, then fallbacks if no shopping_results
+        attempts = [query, f"{query} price", f"{query} buy online"]
+        data = None
+        for attempt in attempts:
+            data = _call_serp(attempt)
+            if data and data.get('shopping_results'):
+                # prefer first non-empty result set
+                break
+
+        if not data or not data.get('shopping_results'):
+            self.last_error = 'SerpAPI returned no shopping results after retries'
+            return []
+
+        normalized: List[Dict[str, Any]] = []
+        for item in data.get('shopping_results', []):
+            if len(normalized) >= limit:
+                break
+            title = item.get('title') or item.get('name')
+            raw_price = item.get('price') or item.get('extracted_price') or item.get('converted_price')
+            if not raw_price:
+                # skip items without price
+                continue
+            price = None
+            try:
+                cleaned = re.sub(r'[^0-9.]', '', str(raw_price))
+                if cleaned:
+                    from decimal import Decimal
+                    price = Decimal(cleaned)
+            except Exception:
+                price = None
+            if price is None:
+                continue
+
+            store = item.get('source') or item.get('merchant') or item.get('store')
+            link = item.get('product_link') or item.get('link') or item.get('url')
+            if not (title and store and link):
+                continue
+            normalized.append({'store': store, 'name': title, 'price': price, 'url': link, 'provider': 'SerpAPI'})
+
+        logger.info('SERPAPI RESULT COUNT %d for query %s', len(normalized), query)
+        if not normalized:
+            self.last_error = 'SerpAPI returned zero normalized items after filtering'
+        return normalized
+
+    # --- HTTP helpers ---
+    def _fetch(self, url: str) -> Optional[str]:
+        headers = {"User-Agent": random.choice(USER_AGENTS)}
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                logger.warning("fetch non-200 %s %s", resp.status_code, url)
+                return None
+            if "captcha" in resp.text.lower() or "robot" in resp.text.lower():
+                return None
+            return resp.text
+        except Exception as exc:
+            logger.warning("fetch error %s", exc)
+            return None
+
+    def _fetch_selenium(self, url: str) -> Optional[str]:
+        try:
+            from apps.scraper.stealth_browser import StealthBrowser
+        except Exception:
+            return None
+        try:
+            with StealthBrowser() as browser:
+                browser.get(url)
+                time.sleep(random.uniform(1.2, 2.2))
+                return browser.page_source
+        except Exception as exc:
+            logger.warning("selenium fetch failed %s", exc)
+            return None
+
+    # --- Parsing helpers ---
+    def _parse_price(self, text: str) -> Optional[Decimal]:
+        if not text:
+            return None
+        cleaned = re.sub(r"[^0-9.]", "", text)
+        if not cleaned:
+            return None
+        try:
+            return Decimal(cleaned)
+        except Exception:
+            return None
+
+    def _best(self, *values):
+        for v in values:
+            if v:
+                return v
+        return None
+
+    def search_amazon(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        url = f"https://www.amazon.in/s?k={quote_plus(query)}"
+        html = self._fetch(url) or self._fetch_selenium(url)
+        if not html:
+            self.last_error = "Scraping blocked or no results"
+            return []
+        soup = BeautifulSoup(html, "html.parser")
+        time.sleep(random.uniform(0.4, 1.1))
+        cards = soup.select("div.s-result-item[data-component-type='s-search-result']")
+        results: List[Dict[str, Any]] = []
+        for card in cards[:limit]:
+            title_el = card.select_one("h2 a span") or card.select_one("span.a-size-medium.a-color-base.a-text-normal")
+            price_el = card.select_one("span.a-price span.a-offscreen") or card.select_one("span.a-price-whole")
+            rating_el = card.select_one("span.a-icon-alt")
+            link_el = card.select_one("h2 a")
+            name = title_el.text.strip() if title_el else None
+            price = self._parse_price(price_el.text) if price_el else None
+            rating = rating_el.text.strip() if rating_el else None
+            href = link_el.get("href") if link_el else None
+            if not name or not href:
+                continue
+            full_url = href if href.startswith("http") else f"https://www.amazon.in{href}"
+            results.append({
+                "store": "Amazon",
+                "name": name,
+                "price": price,
+                "rating": rating,
+                "url": full_url,
+            })
+        return results
+
+    def search_flipkart(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        url = f"https://www.flipkart.com/search?q={quote_plus(query)}"
+        html = self._fetch(url) or self._fetch_selenium(url)
+        if not html:
+            self.last_error = "Scraping blocked or no results"
+            return []
+        soup = BeautifulSoup(html, "html.parser")
+        time.sleep(random.uniform(0.4, 1.1))
+        cards = soup.select("a._1fQZEK") or soup.select("a.s1Q9rs")
+        results: List[Dict[str, Any]] = []
+        for card in cards[:limit]:
+            title_el = card.select_one("div._4rR01T") or card.select_one("div.KzDlHZ") or card
+            price_el = card.select_one("div._30jeq3._1_WHN1") or card.select_one("div._30jeq3")
+            rating_el = card.select_one("div._3LWZlK")
+            name = title_el.text.strip() if title_el else None
+            price = self._parse_price(price_el.text) if price_el else None
+            rating = rating_el.text.strip() if rating_el else None
+            href = card.get("href") if card else None
+            if not name or not href:
+                continue
+            full_url = href if href.startswith("http") else f"https://www.flipkart.com{href}"
+            results.append({
+                "store": "Flipkart",
+                "name": name,
+                "price": price,
+                "rating": rating,
+                "url": full_url,
+            })
+        return results
+
+    # --- Persistence and fuzzy matching ---
+    def _fuzzy_match_product(self, clean_query: str) -> Optional[Product]:
+        try:
+            from django.contrib.postgres.search import TrigramSimilarity
+            qs = (
+                Product.objects.annotate(similarity=TrigramSimilarity('name', clean_query))
+                .filter(similarity__gte=0.3)
+                .order_by('-similarity')
+            )
+            candidate = qs.first()
+            if candidate and candidate.similarity >= 0.7:
+                return candidate
+        except Exception:
+            pass
+
+        # fallback manual
+        best = None
+        best_score = 0.0
+        for prod in Product.objects.order_by('-updated_at')[:20]:
+            score = SequenceMatcher(None, prod.name.lower(), clean_query.lower()).ratio()
+            if score > best_score:
+                best_score = score
+                best = prod
+        if best_score >= 0.7:
+            return best
+        return None
+
+    def persist_results(self, clean_query: str, raw_query: str, results: List[Dict[str, Any]]):
+        if not results:
+            return {'product': None, 'rows': []}
+
+        product = self._fuzzy_match_product(clean_query)
+        if not product:
+            product = Product.objects.create(name=clean_query or raw_query or "Unknown Product")
+
+        rows = []
+        with transaction.atomic():
+            for res in results:
+                store = res.get('store') or 'Amazon'
+                price_val = res.get('price') or Decimal('0')
+                url = res.get('url') or ''
+                defaults = {
+                    'current_price': price_val,
+                    'product_url': url,
+                    'image_url': res.get('image_url') or '',
+                    'is_available': True,
+                    'metadata': {'rating': res.get('rating')},
                 }
-                
-        return {"found": False}
+                sp, created = StorePrice.objects.update_or_create(
+                    product=product,
+                    store_name=store,
+                    defaults=defaults,
+                )
+
+                # price history with simple delta
+                last_price = None
+                if not created:
+                    last_price = sp.current_price
+                PriceHistory.objects.create(
+                    store_price=sp,
+                    price=price_val,
+                    currency='INR',
+                    change_percentage=None,
+                )
+                sp.last_updated = timezone.now()
+                sp.save()
+
+            product.update_lowest_price()
+
+        # build rows for table
+        price_map = {p.store_name: p.current_price for p in product.prices.all()}
+        amz = price_map.get('Amazon')
+        flip = price_map.get('Flipkart')
+        min_val = min([v for v in [amz, flip] if v is not None], default=None)
+        delta_label = 'STABLE_00'
+        if amz is not None and flip is not None:
+            diff = Decimal(amz) - Decimal(flip)
+            if diff != 0:
+                prefix = 'DROP' if diff > 0 else 'RISE'
+                magnitude = abs(diff)
+                magnitude_label = f"{magnitude:.0f}"
+                delta_label = f"{prefix}_{magnitude_label}"
+
+        fmt = lambda v: f"₹{int(Decimal(v)):,}" if v is not None else 'N/A'
+        row = {
+            'id': product.id,
+            'name': product.name.upper()[:24],
+            'amz': fmt(amz),
+            'flip': fmt(flip),
+            'min': fmt(min_val),
+            'delta': delta_label,
+            'status': product.trend_indicator or 'LIVE',
+            'url': results[0].get('url') if results else '',
+        }
+        rows.append(row)
+        return {'product': product, 'rows': rows}
+
+    # Compatibility wrapper: allow callers to use `scrape()` like other implementations
+    def scrape(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        return self.search_all(query, limit)
